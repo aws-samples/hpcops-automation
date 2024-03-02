@@ -1,0 +1,288 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Deploy a demo of the latest AWS ParallelCluster release. 
+
+### Stack metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Cluster Design
+        Parameters:
+          - OS
+          - Architecture
+          - QueueName
+          - ComputeInstanceMax
+      - Label:
+          default: Networking and Access
+        Parameters:
+          - AvailabilityZone
+          - AllowedIps
+      - Label:
+          default: Miscellaneous
+        Parameters:
+          - ClusterName
+          - ArtifactBucketName
+Conditions:
+  GovCloud: !Equals [!Ref AWS::Partition, 'aws-us-gov']
+  China: !Equals [!Ref AWS::Partition, 'aws-cn']
+
+Parameters:
+  ClusterName:
+    Description: Name of cluster. Must be unique in the Region and different from the stack name.
+    Type: String
+    Default: mycluster
+
+  AvailabilityZone:
+    Description: Availability zone where instances will be launched
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+
+  QueueName:
+    Description: Name of the default Slurm queue
+    Type: String
+    Default: normal
+
+  ComputeInstanceMax:
+    Description: Maximum number of compute instances in the queue
+    Type: Number
+    MinValue: 1
+    Default: 1
+
+  AllowedIps:
+    Description: CIDR-formatted IP range for SSH connections to the cluster
+    Type: String
+    Default: 0.0.0.0/0
+
+  OS:
+    Type: String
+    Default: alinux2
+    AllowedValues:
+      - alinux2
+      - centos7
+      - ubuntu2004
+      - ubuntu2204
+      - rhel8
+    Description: Cluster operating system
+
+  Architecture:
+    Type: String
+    Default: x86
+    AllowedValues:
+      - x86
+    Description: Choose a node architecture.
+
+  ArtifactBucketName:
+    AllowedPattern: ^[0-9a-z]+([0-9a-z-\.]*[0-9a-z])*$
+    ConstraintDescription: >-
+      A bucket for artifacts. This is an existing bucket.
+      The S3 bucket name can include numbers, lowercase letters,
+      and hyphens (-), but it cannot start or end with a hyphen.
+    Description: >-
+      The name of the S3 Bucket where the initial source code from the blog will be copied to.
+    MinLength: 3
+    MaxLength: 63
+    Type: String
+
+  CloudFormationManagementRole:
+    AllowedPattern: ^[0-9a-z]+([0-9a-zA-Z-\.\:\/]*[0-9a-zA-Z])*$
+    Description: >-
+      The role that will be used to delete the cloudformation
+    MinLength: 10
+    MaxLength: 100
+    Type: String
+
+
+Mappings:
+  ParallelCluster:
+    Constants:
+      Version: 3.8.0
+  Recipes:
+    Constants:
+      Version: main
+  InstanceTypeForArchitecture:
+    HeadNode:
+      Graviton: c7g.medium
+      GPU: c6a.large
+      x86: c6a.large
+    LoginNodes:
+      Graviton: c7g.large
+      GPU: c6a.xlarge
+      x86: c6a.xlarge
+    ComputeNodes:
+      Graviton: c7g.xlarge
+      GPU: g5.xlarge
+      x86: c6a.xlarge
+
+Resources:
+  EC2Key:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      #KeyFormat: pem
+      KeyName: !Join
+        - '-'
+        - - !Sub ${AWS::StackName}-Stack-Key
+          - Fn::Select:
+                - 4
+                - Fn::Split:
+                    - '-'
+                    - Fn::Select:
+                        - 2
+                        - Fn::Split:
+                            - /
+                            - Ref: AWS::StackId
+      KeyType: ed25519
+  parallelclusterClusterCFnManagementPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties: 
+      Description: Policy to manage cluster for the worker node
+      ManagedPolicyName: !Join
+        - '-'
+        - - 'parallelclusterClusterCFnManagementPolicy'
+          - Fn::Select:
+                - 4
+                - Fn::Split:
+                    - '-'
+                    - Fn::Select:
+                        - 2
+                        - Fn::Split:
+                            - /
+                            - Ref: AWS::StackId
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Sid: cfnright
+          Effect: Allow
+          Action:
+            - cloudformation:DeleteChangeSet
+            - cloudformation:DeleteStack
+            - cloudformation:DescribeChangeSet
+            - cloudformation:DescribeStacks
+          Resource: !Sub arn:${AWS::Partition}:cloudformation:*:*:*
+        - Sid: lambdaexecute
+          Effect: Allow
+          Action:
+            - lambda:InvokeFunction
+            - lambda:DeleteFunction
+          Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:pcluster*
+        - Sid: ec2
+          Effect: Allow
+          Action:
+            - ec2:DescribePlacementGroups
+          Resource: '*'
+
+
+  PclusterClusterProvider:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TemplateURL: !Sub
+        - https://${AWS::Region}-aws-parallelcluster.s3.${AWS::Region}.${AWS::URLSuffix}/parallelcluster/${Version}/templates/custom_resource/cluster.yaml
+        - { Version: !FindInMap [ParallelCluster, Constants, Version] }
+      TimeoutInMinutes: 10
+
+  PclusterVpc:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Parameters:
+        VpcCIDR: 10.0.0.0/16
+        PublicCIDR: 10.0.0.0/24
+        PrivateCIDR: 10.0.16.0/20
+        AvailabilityZone: !Ref AvailabilityZone
+      TemplateURL: !Sub
+        - https://aws-hpc-recipes.s3.us-east-1.${AWS::URLSuffix}/${Version}/recipes/net/hpc_basic/assets/public-private.yaml
+        - { Version: !FindInMap [Recipes, Constants, Version] }
+      TimeoutInMinutes: 10
+
+  PclusterCluster:
+    Type: Custom::PclusterCluster
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      ServiceToken: !GetAtt [ PclusterClusterProvider , Outputs.ServiceToken ]
+      ClusterName: !Ref ClusterName
+      ClusterConfiguration:
+        Image:
+          Os: !Ref OS
+        HeadNode:
+          InstanceType: !FindInMap [ InstanceTypeForArchitecture, HeadNode, !Ref Architecture ]
+          Networking:
+            SubnetId: !GetAtt [ PclusterVpc , Outputs.DefaultPublicSubnet ]
+          Ssh:
+            KeyName: !Ref EC2Key
+            AllowedIps: !Ref AllowedIps
+          Dcv:
+            Enabled: true
+          LocalStorage:
+            RootVolume:
+              Size: 40
+          Iam:
+            AdditionalIamPolicies:
+              - Policy: arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+          CustomActions:
+            OnNodeConfigured:
+              Sequence:
+                - Script: https://raw.githubusercontent.com/aws-samples/hpcops-automation/main/cluster-automation/job-submission.sh
+                  Args:
+                    - !Sub ${AWS::StackName}
+                    - !Sub ${AWS::Region}
+                    - !Ref CloudFormationManagementRole
+        Scheduling:
+          Scheduler: slurm
+          SlurmSettings:
+            QueueUpdateStrategy: TERMINATE
+          SlurmQueues:
+          - Name: !Ref QueueName
+            ComputeResources:
+            - Name: nodes
+              InstanceType: !FindInMap [ InstanceTypeForArchitecture, ComputeNodes, !Ref Architecture ]
+              MinCount: 1
+              MaxCount: !Ref ComputeInstanceMax
+              DisableSimultaneousMultithreading: true
+            Networking:
+              SubnetIds:
+                - !GetAtt [ PclusterVpc , Outputs.DefaultPublicSubnet ]
+                # - !GetAtt [ PclusterVpc , Outputs.DefaultPrivateSubnet ]
+              PlacementGroup:
+                Enabled: true
+            ComputeSettings:
+              LocalStorage:
+                RootVolume:
+                  Size: 40
+            CustomActions:
+              OnNodeConfigured:
+                Sequence:
+                  - Script: https://aws-hpc-recipes.s3.us-east-1.amazonaws.com/main/recipes/storage/mountpoint_s3/assets/install.sh
+                  - Script: https://aws-hpc-recipes.s3.us-east-1.amazonaws.com/main/recipes/storage/mountpoint_s3/assets/mount.sh
+                    Args:
+                      - !Ref ArtifactBucketName
+                      - /ArtifactBucket
+                      - '--allow-delete --allow-root'
+            Iam:
+              S3Access:
+                - BucketName: !Ref ArtifactBucketName
+                  EnableWriteAccess: true
+              AdditionalIamPolicies:
+                - Policy: arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+                - Policy: !Ref parallelclusterClusterCFnManagementPolicy
+Outputs:
+  HeadNodeIp:
+    Description: The Public IP address of the HeadNode
+    Value: !GetAtt [ PclusterCluster, headNode.publicIpAddress ]
+    Export:
+      Name: !Sub ${AWS::StackName}-HeadNodeIp
+  SystemManagerUrl:
+    Description: URL to access the HeadNode via SystemManager
+    Value: !Sub
+      - https://${ConsoleDomain}/systems-manager/session-manager/${InstanceId}?region=${AWS::Region}
+      - { ConsoleDomain: !If [ GovCloud, 'console.amazonaws-us-gov.com', !If [ China, 'console.amazonaws.cn', !Sub '${AWS::Region}.console.aws.amazon.com']],
+          InstanceId: !GetAtt [ PclusterCluster, headNode.instanceId ]
+        }
+    Export:
+      Name: !Sub ${AWS::StackName}-SystemManagerUrl
+  ValidationMessages:
+    Description: Warnings from cluster create or update operations.
+    Value: !GetAtt PclusterCluster.validationMessages

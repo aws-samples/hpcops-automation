@@ -1,0 +1,804 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  CloudFormation template for deploying CI/CD to manage AWS ParallelCluster Infrastructure and running a simple workload in the cluster.
+Metadata:
+  LICENSE: Apache License, Version 2.0
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: AWS Solution configuration
+        Parameters:
+          - ArtifactBucketName
+    ParameterLabels:
+      ArtifactBucketName:
+        default: AWS Solution S3 bucket name
+      CodeCommitRepositoryName:
+        default: CodeCommit Repository Name
+      CodeCommitRepositoryDescription:
+        default: CodeCommit Repository Description
+      CodeCommitBranchName:
+        default: CodeCommit Branch Name
+
+Parameters:
+  ArtifactBucketName:
+    AllowedPattern: ^[0-9a-z]+([0-9a-z-\.]*[0-9a-z])*$
+    ConstraintDescription: >-
+      A bucket for artifacts. This can be new or existing bucket.
+      If it does not exist, this template will create it.
+      The S3 bucket name can include numbers, lowercase letters,
+      and hyphens (-), but it cannot start or end with a hyphen.
+    Default: hpc-devops
+    Description: >-
+      The nane of the S3 Bucket where the initial source code from the blog will be copied to.
+    MinLength: 3
+    MaxLength: 63
+    Type: String
+  CodeCommitRepositoryName:
+    AllowedPattern: ([0-9a-z-]*[0-9a-z])*$
+    Type: String
+    MinLength: 5
+    MaxLength: 20
+    Default: hpcdevops
+    Description: >-
+      Name of the CodeCommit repository. Keep the default name unless you are customizing the template. Changing the name updates code references to point to a new location.
+  CodeCommitRepositoryDescription:
+    # AllowedPattern: ([0-9a-z-]*[0-9a-z])*$
+    Type: String
+    MinLength: 5
+    MaxLength: 100
+    Default: 'CodeCommit for HPC DevOps'  
+    Description: >- 
+      Description of the CodeCommit repository.
+  CodeCommitBranchName:
+    # AllowedPattern: ^([0-9a-zA-Z-_]+/)*$
+    Type: String
+    MinLength: 4
+    MaxLength: 20
+    Default: main  
+    Description: >-
+      Name of the CodeCommit branch. 
+
+Resources:
+  CodeBuilderLambdaCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken:
+        !Sub
+        - arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaFunctionName}
+        - { LambdaFunctionName: !Ref CodeBuildLambdaFunction }
+
+  CodeBuildLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: upload the code the firs time to the bucket
+      Handler: index.lambda_handler
+      Role: !GetAtt CodeBuilderRole.Arn
+      Runtime: python3.11
+      MemorySize: 128
+      Timeout: 240
+      Environment:
+        Variables:
+          BUCKET: !Join
+            - '-'
+            - - !Ref ArtifactBucketName
+              - Fn::Select:
+                - 4
+                - Fn::Split:
+                    - '-'
+                    - Fn::Select:
+                        - 2
+                        - Fn::Split:
+                            - /
+                            - Ref: AWS::StackId
+          CODEPIPELINENAME: !Sub ${AWS::StackName}-
+      FunctionName: !Join
+            - '-'
+            - - 'CopyInitialCode'
+              - Fn::Select:
+                      - 4
+                      - Fn::Split:
+                          - '-'
+                          - Fn::Select:
+                              - 2
+                              - Fn::Split:
+                                  - /
+                                  - Ref: AWS::StackId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import urllib3.request
+          import shutil
+          import logging
+          import zipfile
+
+          from botocore.client import ClientError
+
+          s3 = boto3.client('s3')
+          s3_resource = boto3.resource('s3')
+
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.INFO)
+
+          logger.info(f"Loading function")
+          codepipeline_name = os.environ["CODEPIPELINENAME"] 
+          def lambda_handler(event, context):
+              print("Received event: " + json.dumps(event, indent=2))
+              # Get the object from the event and show its content type
+              key = "repo-src.zip"
+              unzipkey = "cluster-launch.yaml"
+
+              srcurl = f"https://raw.githubusercontent.com/aws-samples/hpcops-automation/main/cluster-automation/{unzipkey}"
+              bucket_name = os.environ["BUCKET"]
+              localfile = f"/tmp/{unzipkey}"
+              localzipfile = f"/tmp/{key}"
+
+              requesttype = "Create"
+                  
+              try:
+                if "RequestType" in event:
+                  requesttype = event["RequestType"]
+                http = urllib3.PoolManager()
+
+                if requesttype == "Create" or requesttype == "Update":
+                  try:
+                    s3.head_bucket(Bucket=bucket_name)
+                  except ClientError:
+                    logger.info(f"creating bucket s3://{bucket_name}")
+                    bucket = s3.create_bucket(Bucket=bucket_name)
+
+                  ## download
+                  with http.request('GET', srcurl, preload_content=False) as r, open(localfile, 'wb') as out_file:       
+                      shutil.copyfileobj(r, out_file)
+
+                  ## zip
+                  with zipfile.ZipFile(localzipfile, "w") as zf:
+                    zf.write(localfile, arcname=unzipkey)
+
+                  ## upload to dest s3
+                  logger.info(f"uploading file to s3://{bucket_name}/{key}")
+                  s3.upload_file(localzipfile, bucket_name, key)
+                else:
+                  artifact_bucket = s3_resource.Bucket(bucket_name)
+                  logger.info(f"deleting file to s3://{bucket_name}/{key}")
+                  artifact_bucket.objects.filter(Prefix=f"{key}").delete()
+                  for obj in artifact_bucket.objects.all():
+                    if( obj.key.startswith(codepipeline_name)):
+                      logger.info(f"deleting s3://{bucket_name}/{obj.key}")
+                      obj.delete()
+
+
+                send_response(event, context, "SUCCESS", "")
+                return
+              except Exception as e:
+                  print(e)
+                  send_response(event, context, "FAILED", "")
+                  raise e
+          def send_response(event, context, response_status, response_data, physical_resource_id=None, no_echo=False):
+            http = urllib3.PoolManager()
+
+            if 'ResponseURL' not in event:
+                return
+
+            response_url = event['ResponseURL']
+
+            if not response_url:
+                return
+
+            response_body = {}
+            response_body['Status'] = response_status
+            response_body['Reason'] = 'See the details in CloudWatch Log Stream: ' + context.log_stream_name
+            response_body['PhysicalResourceId'] = physical_resource_id or context.log_stream_name
+            response_body['StackId'] = event['StackId']
+            response_body['RequestId'] = event['RequestId']
+            response_body['LogicalResourceId'] = event['LogicalResourceId']
+            response_body['NoEcho'] = no_echo
+            response_body['Data'] = {}
+
+            json_response_body = json.dumps(response_body)
+
+            headers = {
+                'content-type' : '',
+                'content-length' : str(len(json_response_body))
+            }
+
+            logger.info("Source Code Copier " + json.dumps(json_response_body))
+            try:
+                response = http.request("PUT", response_url,
+                                        body=json_response_body,
+                                        headers=headers)
+                logger.info(f"Source Code Copier handler status: {response.status}")
+            except Exception as e:
+                logger.error("send_response(..) failed executing http.request(..): " + str(e))                  
+
+
+          
+  
+  CodeBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+      Policies:
+        - PolicyName: EmptyArtifactBucket
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: ManageBucketObjects
+                Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub
+                  - "arn:aws:s3:::${ArtifactBucketName}-${RandomStr}/*"
+                  - RandomStr: !Select
+                    - 4
+                    - Fn::Split:
+                        - '-'
+                        - Fn::Select:
+                            - 2
+                            - Fn::Split:
+                                - /
+                                - Ref: AWS::StackId                
+              - Sid: ListBucket
+                Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:CreateBucket
+                Resource: !Sub
+                  - "arn:aws:s3:::${ArtifactBucketName}-${RandomStr}"
+                  - RandomStr: !Select
+                    - 4
+                    - Fn::Split:
+                        - '-'
+                        - Fn::Select:
+                            - 2
+                            - Fn::Split:
+                                - /
+                                - Ref: AWS::StackId
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: codebuild.amazonaws.com
+      Policies:
+        - PolicyName: CICD-BuildService
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: ListArtifact
+                Effect: Allow
+                Action:
+                - codecommit:PostCommentForPullRequest
+                - codecommit:UpdatePullRequestApprovalState
+                Resource: !Sub arn:aws:iam:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepositoryName}-*
+  CodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Description: !Sub >- 
+        Submit build jobs for ${CodeCommitRepository.Name} as part of a CI/CD pipeline.
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
+        # EnvironmentVariables:
+          # - Name: ARTIFACT_BUCKET
+          #   Value: !Ref ArtifactBucket
+          # - Name: PROJECT_NAME
+          #   Value: !Ref GitHubRepoName
+          # - Name: PROJECT_OWNER
+          #   Value: !Ref GitHubOwner
+          # - Name: SOURCE_BRANCH
+          #   Value: !Ref SourceBranch
+        PrivilegedMode: true
+      Visibility: PRIVATE
+      Source: 
+        Type: CODEPIPELINE
+        Location: !GetAtt CodeCommitRepository.CloneUrlHttp
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: codepipeline.amazonaws.com
+      Policies:
+        - PolicyName: CICD-CodePipelineService
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: ListArtifact
+                Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource: !Sub
+                  - "arn:aws:s3:::${ArtifactBucketName}-${RandomStr}"
+                  - RandomStr: !Select
+                    - 4
+                    - Fn::Split:
+                        - '-'
+                        - Fn::Select:
+                            - 2
+                            - Fn::Split:
+                                - /
+                                - Ref: AWS::StackId                
+              - Sid: PutArtifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub
+                  - "arn:aws:s3:::${ArtifactBucketName}-${RandomStr}/*"
+                  - RandomStr: !Select
+                    - 4
+                    - Fn::Split:
+                        - '-'
+                        - Fn::Select:
+                            - 2
+                            - Fn::Split:
+                                - /
+                                - Ref: AWS::StackId                
+              - Sid: ManageCloudFormation
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:SetStackPolicy
+                  - cloudformation:UpdateStack
+                  - cloudformation:ValidateTemplate
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:*:*
+              - Sid: PassRoleToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-HPCDeploymentServiceRole*
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: StartBuilds
+                Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt CodeBuild.Arn
+              - Sid: ManageLambda
+                Effect: Allow
+                Action:
+                  - lambda:GetAccountSettings
+                  - lambda:GetAlias
+                  - lambda:GetEventSourceMapping
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:GetPolicy
+                  - lambda:InvokeFunction
+                  - lambda:ListAliases
+                  - lambda:ListEventSourceMappings
+                  - lambda:ListFunctions
+                  - lambda:ListTags
+                  - lambda:ListVersionsByFunction
+                Resource: arn:*:lambda:*:*:*
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSCodeCommitFullAccess
+
+  HPCCloudFormationStackTerminationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal: 
+              AWS: "*"
+            Condition: 
+              ArnLike: 
+                "aws:PrincipalArn": !Sub arn:aws:iam::${AWS::AccountId}:role/parallelcluster/${AWS::StackName}-DemoCluster/${AWS::StackName}-DemoCluster-ComputeFleet*
+      Policies:
+        - PolicyName: !Join
+            - '-'
+            - - 'HPCCloudFormationStackTerminationRole'
+              - Fn::Select:
+                      - 4
+                      - Fn::Split:
+                          - '-'
+                          - Fn::Select:
+                              - 2
+                              - Fn::Split:
+                                  - /
+                                  - Ref: AWS::StackId
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: cfnright
+                Effect: Allow
+                Action:
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStacks
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:*:*
+              - Sid: lambdaexecute
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:DeleteFunction
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:pcluster*
+              - Sid: ec2
+                Effect: Allow
+                Action:
+                  - ec2:DescribePlacementGroups
+                Resource: '*'
+
+
+  HPCDeploymentServiceRole:
+    Type: AWS::IAM::Role
+    # https://docs.aws.amazon.com/parallelcluster/latest/ug/iam-roles-in-parallelcluster-v3.html#iam-roles-in-parallelcluster-v3-user-policy-manage-iam
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: cloudformation.amazonaws.com
+      Policies:
+        - PolicyName: !Join
+            - '-'
+            - - 'HPCDeploymentService'
+              - Fn::Select:
+                      - 4
+                      - Fn::Split:
+                          - '-'
+                          - Fn::Select:
+                              - 2
+                              - Fn::Split:
+                                  - /
+                                  - Ref: AWS::StackId
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: EC2Read
+                Effect: Allow
+                Action: 
+                  - ec2:Describe*
+                Resource: '*'
+              - Sid: EC2Write
+                Effect: Allow
+                Action: 
+                  - ec2:AllocateAddress
+                  - ec2:AssociateAddress
+                  - ec2:AttachNetworkInterface
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:CreateFleet
+                  - ec2:CreateLaunchTemplate
+                  - ec2:CreateLaunchTemplateVersion
+                  - ec2:CreateNetworkInterface
+                  - ec2:CreatePlacementGroup
+                  - ec2:CreateSecurityGroup
+                  - ec2:CreateSnapshot
+                  - ec2:CreateTags
+                  - ec2:CreateVolume
+                  - ec2:DeleteLaunchTemplate
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DeletePlacementGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:DeleteVolume
+                  - ec2:DisassociateAddress
+                  - ec2:ModifyLaunchTemplate
+                  - ec2:ModifyNetworkInterfaceAttribute
+                  - ec2:ModifyVolume
+                  - ec2:ModifyVolumeAttribute
+                  - ec2:ReleaseAddress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RunInstances
+                  - ec2:TerminateInstances
+                  - ec2:CreateInternetGateway
+                  - ec2:CreateVpc 
+                  - ec2:DeleteVpc
+                  - ec2:DeleteInternetGateway 
+                  - ec2:CreateKeyPair
+                  - ec2:DeleteKeyPair
+                  - ec2:ModifyVpcAttribute
+                  - ec2:AttachInternetGateway
+                  - ec2:DetachInternetGateway
+                  - ec2:CreateRouteTable
+                  - ec2:DeleteRouteTable
+                  - ec2:CreateSubnet
+                  - ec2:DeleteSubnet
+                  - ec2:CreateRoute
+                  - ec2:DeleteRoute
+                  - ec2:AssociateRouteTable
+                  - ec2:DisassociateRouteTable
+                  - ec2:ModifySubnetAttribute
+                  - ec2:CreateNatGateway
+                  - ec2:DeleteNatGateway
+                Resource: '*'
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action: 
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:DescribeLogGroups
+                  - logs:CreateLogGroup
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                  - logs:CreateExportTask
+                  - logs:DescribeLogStreams
+                  - logs:DescribeExportTasks
+                  - logs:DescribeMetricFilters
+                  - logs:PutMetricFilter
+                  - logs:DeleteMetricFilter
+                Resource: '*'
+              - Sid: IamRole
+                Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                  - iam:DeleteRole
+                  - iam:TagRole
+                  - iam:CreateRole
+                  - iam:DetachRolePolicy
+                  - iam:GetRole
+                  - iam:PassRole
+                Resource: 
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/parallelcluster*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/ParallelCluster*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-${CodeCommitRepositoryName}-*
+              - Sid: IamInlinePolicy
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:GetPolicy
+                  - iam:DeletePolicy
+                  - iam:ListPolicyVersions
+                Resource: 
+                  - !Sub arn:aws:iam::${AWS::AccountId}:policy/parallelcluster*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:policy/ParallelCluster*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:policy/DefaultParallelClusterIamAdminPolicy*                  
+                  - !Sub arn:aws:iam::${AWS::AccountId}:policy/${AWS::StackName}-${CodeCommitRepositoryName}-*
+              - Sid: IamPolicy2
+                Effect: Allow
+                Action:
+                  - iam:AttachRolePolicy
+                Resource: 
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/parallelcluster*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/ParallelCluster*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-${CodeCommitRepositoryName}-*
+              - Sid: IamPolicy
+                Effect: Allow
+                Action:
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                Resource: 
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/parallelcluster*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/ParallelCluster*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-${CodeCommitRepositoryName}-*
+                Condition:
+                  ArnLike:
+                    iam:PolicyARN:
+                      - !Sub arn:aws:iam::${AWS::AccountId}:policy/parallelcluster*
+                      - !Sub arn:aws:iam::${AWS::AccountId}:policy/ParallelCluster*
+                      - !Sub arn:aws:iam::${AWS::AccountId}:policy/DefaultParallelClusterIamAdminPolicy*                  
+                      - !Sub arn:aws:iam::${AWS::AccountId}:policy/${AWS::StackName}-${CodeCommitRepositoryName}-*
+                      - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+                      - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+                      - arn:aws:iam::aws:policy/AWSBatchFullAccess
+                      - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+                      - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+                      - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+                      - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+                      - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+                      - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder
+                      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+              - Sid: ManageSSMParameter
+                Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub  arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ec2/keypair/*                                
+              - Sid: ManageCloudFormation
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:SetStackPolicy
+                  - cloudformation:UpdateStack
+                  - cloudformation:ValidateTemplate
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:*:*
+              - Sid: ManagedLambda
+                Effect: Allow
+                Action:
+                  - lambda:PublishLayerVersion                      
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:GetFunction
+                  - lambda:InvokeFunction
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:TagResource
+                  - lambda:ListTags
+                  - lambda:UntagResource
+                  - lambda:DeleteLayerVersion
+                  - lambda:GetLayerVersion
+                Resource: 
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-${CodeCommitRepositoryName}-*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:parallelcluster-*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:pcluster-*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:PCLayer*
+              - Sid: S3
+                Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:List*
+                Resource:
+                  - arn:aws:s3::*:*
+              - Sid: Bucket
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:Deletebucket
+                Resource:
+                  - !Sub arn:aws:s3:::${AWS::StackName}-${CodeCommitRepositoryName}-*
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSCodeCommitReadOnly  
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      PipelineType: V2
+      ArtifactStore:
+        Type: S3
+        Location: !Sub
+          - "${ArtifactBucketName}-${RandomStr}"
+          - RandomStr: !Select
+            - 4
+            - Fn::Split:
+                - '-'
+                - Fn::Select:
+                    - 2
+                    - Fn::Split:
+                        - /
+                        - Ref: AWS::StackId                
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+          - Name: SourceAction 
+            ActionTypeId: 
+              Category: Source 
+              Owner: AWS 
+              Version: 1 
+              Provider: CodeCommit 
+            OutputArtifacts: 
+              - Name: CodeSource 
+            Configuration: 
+              BranchName: !Ref CodeCommitBranchName 
+              RepositoryName: !GetAtt CodeCommitRepository.Name
+              PollForSourceChanges: false 
+            RunOrder: 1 
+        - Name: Deploy
+          Actions:
+            - Name: CloudFormationInfrastructure
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              InputArtifacts:
+                - Name: CodeSource
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                RoleArn: !GetAtt HPCDeploymentServiceRole.Arn
+                StackName: !Sub ${AWS::StackName}-${CodeCommitRepository.Name}-Infrastructure
+                TemplatePath: 'CodeSource::cluster-launch.yaml'
+                ParameterOverrides: !Sub 
+                  - '{"ClusterName":"${AWS::StackName}-DemoCluster","AvailabilityZone":"us-east-1a","QueueName":"normal","ComputeInstanceMax":"1","AllowedIps":"0.0.0.0/0","OS":"alinux2","Architecture":"x86","ArtifactBucketName":"${ArtifactBucketName}-${RandomStr}","CloudFormationManagementRole":"${HPCCloudFormationStackTerminationRole.Arn}"}'
+                  - RandomStr: !Select
+                    - 4
+                    - Fn::Split:
+                        - '-'
+                        - Fn::Select:
+                            - 2
+                            - Fn::Split:
+                                - /
+                                - Ref: AWS::StackId                
+              RunOrder: 2
+      Tags:
+        - Key: Name
+          Value: !Sub ${CodeCommitRepository.Name}-Pipeline
+  CodeCommitRepository:
+    DependsOn: CodeBuilderLambdaCustomResource
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      Code: 
+        S3:
+          Bucket: !Sub
+            - "${ArtifactBucketName}-${RandomStr}"
+            - RandomStr: !Select
+              - 4
+              - Fn::Split:
+                  - '-'
+                  - Fn::Select:
+                      - 2
+                      - Fn::Split:
+                          - /
+                          - Ref: AWS::StackId                
+          Key: repo-src.zip
+      RepositoryDescription: !Ref CodeCommitRepositoryDescription
+      RepositoryName: !Join
+        - '-'
+        - - !Ref CodeCommitRepositoryName
+          - Fn::Select:
+                  - 4
+                  - Fn::Split:
+                      - '-'
+                      - Fn::Select:
+                          - 2
+                          - Fn::Split:
+                              - /
+                              - Ref: AWS::StackId
+
+      # Tags: 
+      #   - HPCDevOps
+      # Triggers: 
+      #   - RepositoryTrigger
+
+Outputs:
+  CodePipelineURL:
+    Description: The URL of the created pipeline.
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${CodePipeline}
+  Postdeployment:
+    Description: See the deployment guide for postdeployment steps.
+    Value: https://fwd.aws/BrGzY?
