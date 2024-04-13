@@ -211,9 +211,6 @@ Resources:
                 logger.info(f"Source Code Copier handler status: {response.status}")
             except Exception as e:
                 logger.error("send_response(..) failed executing http.request(..): " + str(e))                  
-
-
-          
   
   CodeBuilderRole:
     Type: AWS::IAM::Role
@@ -292,7 +289,7 @@ Resources:
                 Action:
                 - codecommit:PostCommentForPullRequest
                 - codecommit:UpdatePullRequestApprovalState
-                Resource: !Sub arn:aws:iam:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepositoryName}-*
+                Resource: !Sub arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepositoryName}-*
   CodeBuild:
     Type: AWS::CodeBuild::Project
     Properties:
@@ -305,15 +302,6 @@ Resources:
         Type: LINUX_CONTAINER
         ComputeType: BUILD_GENERAL1_SMALL
         Image: aws/codebuild/standard:5.0
-        # EnvironmentVariables:
-          # - Name: ARTIFACT_BUCKET
-          #   Value: !Ref ArtifactBucket
-          # - Name: PROJECT_NAME
-          #   Value: !Ref GitHubRepoName
-          # - Name: PROJECT_OWNER
-          #   Value: !Ref GitHubOwner
-          # - Name: SOURCE_BRANCH
-          #   Value: !Ref SourceBranch
         PrivilegedMode: true
       Visibility: PRIVATE
       Source: 
@@ -453,7 +441,8 @@ Resources:
                   - cloudformation:DeleteStack
                   - cloudformation:DescribeChangeSet
                   - cloudformation:DescribeStacks
-                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:*:*
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+                # Resource: !Sub arn:${AWS::Partition}:cloudformation:*:*:*
               - Sid: lambdaexecute
                 Effect: Allow
                 Action:
@@ -654,7 +643,8 @@ Resources:
                   - cloudformation:SetStackPolicy
                   - cloudformation:UpdateStack
                   - cloudformation:ValidateTemplate
-                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:*:*
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+                # Resource: !Sub arn:${AWS::Partition}:cloudformation:*:*:*
               - Sid: ManagedLambda
                 Effect: Allow
                 Action:
@@ -789,11 +779,6 @@ Resources:
                           - Fn::Split:
                               - /
                               - Ref: AWS::StackId
-
-      # Tags: 
-      #   - HPCDevOps
-      # Triggers: 
-      #   - RepositoryTrigger
 
 Outputs:
   CodePipelineURL:
