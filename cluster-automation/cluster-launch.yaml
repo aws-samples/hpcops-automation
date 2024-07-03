@@ -158,6 +158,7 @@ Resources:
             - cloudformation:DeleteStack
             - cloudformation:DescribeChangeSet
             - cloudformation:DescribeStacks
+            - cloudformation:CreateChangeSet
           Resource: !Sub arn:${AWS::Partition}:cloudformation:*:*:*
         - Sid: lambdaexecute
           Effect: Allow
