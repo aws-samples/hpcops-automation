@@ -70,9 +70,9 @@ Resources:
   CodeBuildLambdaFunction:
     Type: AWS::Lambda::Function
     Properties:
-      Description: upload the code the firs time to the bucket
+      Description: upload the code the first time to the bucket
       Handler: index.lambda_handler
-      Role: !GetAtt CodeBuilderRole.Arn
+      Role: !GetAtt CodeBuildPipelineRole.Arn
       Runtime: python3.11
       MemorySize: 128
       Timeout: 240
@@ -93,7 +93,8 @@ Resources:
           CODEPIPELINENAME: !Sub ${AWS::StackName}-
       FunctionName: !Join
             - '-'
-            - - 'CopyInitialCode'
+            - - !Sub ${AWS::StackName}
+              - 'CopyInitialCode'
               - Fn::Select:
                       - 4
                       - Fn::Split:
@@ -212,7 +213,7 @@ Resources:
             except Exception as e:
                 logger.error("send_response(..) failed executing http.request(..): " + str(e))                  
   
-  CodeBuilderRole:
+  CodeBuildPipelineRole:
     Type: AWS::IAM::Role
     Properties:
       Path: /
@@ -222,9 +223,12 @@ Resources:
           - Effect: Allow
             Action: sts:AssumeRole
             Principal:
-              Service: lambda.amazonaws.com
+              Service: 
+                - lambda.amazonaws.com
+                - codebuild.amazonaws.com
+                - codepipeline.amazonaws.com
       Policies:
-        - PolicyName: EmptyArtifactBucket
+        - PolicyName: CodeBuildPipelinePolicy
           PolicyDocument:
             Version: 2012-10-17
             Statement:
@@ -265,98 +269,12 @@ Resources:
                             - Fn::Split:
                                 - /
                                 - Ref: AWS::StackId
-      ManagedPolicyArns:
-        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-
-  CodeBuildServiceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      Path: /
-      AssumeRolePolicyDocument:
-        Version: 2012-10-17
-        Statement:
-          - Effect: Allow
-            Action: sts:AssumeRole
-            Principal:
-              Service: codebuild.amazonaws.com
-      Policies:
-        - PolicyName: CICD-BuildService
-          PolicyDocument:
-            Version: 2012-10-17
-            Statement:
               - Sid: ListArtifact
                 Effect: Allow
                 Action:
                 - codecommit:PostCommentForPullRequest
                 - codecommit:UpdatePullRequestApprovalState
                 Resource: !Sub arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepositoryName}-*
-  CodeBuild:
-    Type: AWS::CodeBuild::Project
-    Properties:
-      Description: !Sub >- 
-        Submit build jobs for ${CodeCommitRepository.Name} as part of a CI/CD pipeline.
-      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
-      Artifacts:
-        Type: CODEPIPELINE
-      Environment:
-        Type: LINUX_CONTAINER
-        ComputeType: BUILD_GENERAL1_SMALL
-        Image: aws/codebuild/standard:5.0
-        PrivilegedMode: true
-      Visibility: PRIVATE
-      Source: 
-        Type: CODEPIPELINE
-        Location: !GetAtt CodeCommitRepository.CloneUrlHttp
-  CodePipelineServiceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      Path: /
-      AssumeRolePolicyDocument:
-        Version: 2012-10-17
-        Statement:
-          - Effect: Allow
-            Action: sts:AssumeRole
-            Principal:
-              Service: codepipeline.amazonaws.com
-      Policies:
-        - PolicyName: CICD-CodePipelineService
-          PolicyDocument:
-            Version: 2012-10-17
-            Statement:
-              - Sid: ListArtifact
-                Effect: Allow
-                Action:
-                  - s3:GetBucketVersioning
-                  - s3:ListBucket
-                  - s3:ListBucketVersions
-                Resource: !Sub
-                  - "arn:aws:s3:::${ArtifactBucketName}-${RandomStr}"
-                  - RandomStr: !Select
-                    - 4
-                    - Fn::Split:
-                        - '-'
-                        - Fn::Select:
-                            - 2
-                            - Fn::Split:
-                                - /
-                                - Ref: AWS::StackId                
-              - Sid: PutArtifacts
-                Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:GetObjectVersion
-                  - s3:PutObject
-                Resource: !Sub
-                  - "arn:aws:s3:::${ArtifactBucketName}-${RandomStr}/*"
-                  - RandomStr: !Select
-                    - 4
-                    - Fn::Split:
-                        - '-'
-                        - Fn::Select:
-                            - 2
-                            - Fn::Split:
-                                - /
-                                - Ref: AWS::StackId                
               - Sid: ManageCloudFormation
                 Effect: Allow
                 Action:
@@ -384,7 +302,7 @@ Resources:
                 Action:
                   - codebuild:BatchGetBuilds
                   - codebuild:StartBuild
-                Resource: !GetAtt CodeBuild.Arn
+                Resource: !Sub arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/*
               - Sid: ManageLambda
                 Effect: Allow
                 Action:
@@ -402,8 +320,26 @@ Resources:
                   - lambda:ListVersionsByFunction
                 Resource: arn:*:lambda:*:*:*
       ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
         - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSCodeCommitFullAccess
-
+  CodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Description: !Sub >- 
+        Submit build jobs for ${CodeCommitRepositoryName} as part of a CI/CD pipeline.
+      ServiceRole: !GetAtt CodeBuildPipelineRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
+        PrivilegedMode: true
+      Visibility: PRIVATE
+      Source: 
+        Type: CODEPIPELINE
+        Location: !GetAtt CodeCommitRepository.CloneUrlHttp
+ 
   HPCCloudFormationStackTerminationRole:
     Type: AWS::IAM::Role
     Properties:
@@ -643,8 +579,9 @@ Resources:
                   - cloudformation:SetStackPolicy
                   - cloudformation:UpdateStack
                   - cloudformation:ValidateTemplate
-                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
-                # Resource: !Sub arn:${AWS::Partition}:cloudformation:*:*:*
+                Resource: 
+                  - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+                  - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
               - Sid: ManagedLambda
                 Effect: Allow
                 Action:
@@ -680,7 +617,7 @@ Resources:
                   - s3:CreateBucket
                   - s3:Deletebucket
                 Resource:
-                  - !Sub arn:aws:s3:::${AWS::StackName}-${CodeCommitRepositoryName}-*
+                  - !Sub arn:aws:s3:::*-${CodeCommitRepositoryName}-*
       ManagedPolicyArns:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSCodeCommitReadOnly  
   CodePipeline:
@@ -700,7 +637,7 @@ Resources:
                     - Fn::Split:
                         - /
                         - Ref: AWS::StackId                
-      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      RoleArn: !GetAtt CodeBuildPipelineRole.Arn
       Stages:
         - Name: Source
           Actions:
